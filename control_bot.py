@@ -21,7 +21,7 @@ CONTROL_PASSWORD=os.environ.get('GIANT_PASSWORD','')
 DEFAULT_LANG=(os.environ.get('CONTROL_LANGUAGE') or 'ar').strip().lower()
 ROOM_PASSWORD=os.environ.get('ROOM_PASSWORD','')
 POLL=float(os.environ.get('CONTROL_POLL_SECONDS','2'))
-CONTROL_BOT_VERSION='username-login-v3'
+CONTROL_BOT_VERSION='username-login-v4-userid'
 if not SERVER_URL or not SERVER_KEY or not CONTROL_USERNAME or not CONTROL_PASSWORD:
     raise SystemExit('Missing SUPABASE_URL/SUPABASE_KEY/GIANT_USERNAME/GIANT_PASSWORD')
 
@@ -127,7 +127,12 @@ async def login_client(username,password):
     client=create_supabase_client(SERVER_URL,SERVER_KEY)
     email=await resolve_email(client,username)
     res=await run(lambda: client.auth.sign_in_with_password({'email':email,'password':password}))
-    if not res or not getattr(res,'user',None): return None, 'login failed; check Supabase key, email mapping, and password'
+    user=getattr(res,'user',None) if res else None
+    user_id=getattr(user,'id',None)
+    if not user_id: return None, 'login succeeded but Supabase returned no user id'
+    # Recent gotrue clients do not always populate client.auth.user after sign-in.
+    # Keep the authoritative id returned by sign_in_with_password for room checks.
+    client._giant_user_id=str(user_id)
     return client, None
 
 async def find_room(client,name):
@@ -156,9 +161,15 @@ async def member_rank(client, room_id, user_id):
         log.warning('rank lookup failed room=%s user=%s: %s', room_id, user_id, exc)
         return None
 
+def client_user_id(client):
+    uid=getattr(client,'_giant_user_id',None)
+    if uid:
+        return str(uid)
+    user=getattr(getattr(client,'auth',None),'user',None)
+    return str(getattr(user,'id',None) or '') or None
+
 async def require_bot_admin(client, room):
-    uid = getattr(getattr(client, 'auth', None), 'user', None)
-    uid = getattr(uid, 'id', None)
+    uid = client_user_id(client)
     if not uid:
         return False, 'bot user id unavailable'
     rank = await member_rank(client, room['id'], uid)
@@ -169,8 +180,7 @@ async def require_bot_admin(client, room):
 async def announce(client, room_id, text):
     # Used only for connection status; feature bots remain independent.
     try:
-        uid=getattr(getattr(client,'auth',None),'user',None)
-        uid=getattr(uid,'id',None)
+        uid=client_user_id(client)
         if uid:
             await asyncio.to_thread(lambda: client.table('room_messages').insert({'room_id':room_id,'user_id':uid,'content':text,'message_type':'text'}).execute())
     except Exception: pass
@@ -196,7 +206,7 @@ async def child_runner(rec):
         rec['rank']=rank; rec['status']='online'; rec['updated_at']=now(); save(BOTS_FILE,load(BOTS_FILE,[]))
         while True:
             # If the room removes the bot's moderation rank, stop managing it.
-            current_rank = await member_rank(client, room_id, getattr(getattr(client,'auth',None),'user',None).id)
+            current_rank = await member_rank(client, room_id, client_user_id(client))
             if current_rank not in BOT_ALLOWED_RANKS:
                 rec['status']='error'; rec['error']=f'bot rank changed to {current_rank or "unknown"}; moderator/admin required'
                 save(BOTS_FILE,load(BOTS_FILE,[]))
