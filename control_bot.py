@@ -12,15 +12,15 @@ LOG_DIR=BASE/'logs'; LOG_DIR.mkdir(exist_ok=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | control | %(message)s', handlers=[logging.FileHandler(LOG_DIR/'control.log',encoding='utf-8'), logging.StreamHandler()])
 log=logging.getLogger('control')
 
-SERVER_URL=os.environ.get('SERVER_URL') or os.environ.get('SUPABASE_URL','').strip()
-SERVER_KEY=os.environ.get('SERVER_KEY') or os.environ.get('SUPABASE_KEY','').strip()
-CONTROL_USERNAME=(os.environ.get('BOT_USERNAME') or os.environ.get('CONTROL_BOT_USERNAME') or os.environ.get('GIANT_USERNAME') or '').strip()
-CONTROL_PASSWORD=os.environ.get('BOT_PASSWORD') or os.environ.get('CONTROL_BOT_PASSWORD') or os.environ.get('GIANT_PASSWORD') or ''
+SERVER_URL=os.environ.get('SUPABASE_URL','').strip()
+SERVER_KEY=os.environ.get('SUPABASE_KEY','').strip()
+CONTROL_USERNAME=os.environ.get('GIANT_USERNAME','').strip()
+CONTROL_PASSWORD=os.environ.get('GIANT_PASSWORD','')
 DEFAULT_LANG=(os.environ.get('CONTROL_LANGUAGE') or 'ar').strip().lower()
 ROOM_PASSWORD=os.environ.get('ROOM_PASSWORD','')
 POLL=float(os.environ.get('CONTROL_POLL_SECONDS','2'))
 if not SERVER_URL or not SERVER_KEY or not CONTROL_USERNAME or not CONTROL_PASSWORD:
-    raise SystemExit('Missing SERVER_URL/SERVER_KEY/CONTROL_BOT_USERNAME/CONTROL_BOT_PASSWORD')
+    raise SystemExit('Missing SUPABASE_URL/SUPABASE_KEY/GIANT_USERNAME/GIANT_PASSWORD')
 
 sb: Client=create_client(SERVER_URL, SERVER_KEY)
 BOT_ID=None

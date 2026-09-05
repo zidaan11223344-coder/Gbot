@@ -14,10 +14,10 @@
 - إذا كان الماستر يدير عدة غرف: `lang@ar@اسم_الغرفة` أو `lang@en@اسم_الغرفة`
 
 ## المتغيرات
-- CONTROL_BOT_USERNAME
-- CONTROL_BOT_PASSWORD
-- SERVER_URL
-- SERVER_KEY
+- GIANT_USERNAME
+- GIANT_PASSWORD
+- SUPABASE_URL
+- SUPABASE_KEY
 - CONTROL_LANGUAGE
 - ROOM_PASSWORD
 - CONTROL_POLL_SECONDS
