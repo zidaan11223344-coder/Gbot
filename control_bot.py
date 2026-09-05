@@ -13,7 +13,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | co
 log=logging.getLogger('control')
 
 SERVER_URL=os.environ.get('SUPABASE_URL','').strip()
-SERVER_KEY=os.environ.get('SUPABASE_KEY','').strip()
+SERVER_KEY=(os.environ.get('SUPABASE_KEY')
+            or os.environ.get('SUPABASE_ANON_KEY')
+            or os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
+            or '').strip()
 CONTROL_USERNAME=os.environ.get('GIANT_USERNAME','').strip()
 CONTROL_PASSWORD=os.environ.get('GIANT_PASSWORD','')
 DEFAULT_LANG=(os.environ.get('CONTROL_LANGUAGE') or 'ar').strip().lower()
@@ -22,7 +25,10 @@ POLL=float(os.environ.get('CONTROL_POLL_SECONDS','2'))
 if not SERVER_URL or not SERVER_KEY or not CONTROL_USERNAME or not CONTROL_PASSWORD:
     raise SystemExit('Missing SUPABASE_URL/SUPABASE_KEY/GIANT_USERNAME/GIANT_PASSWORD')
 
-sb: Client=create_client(SERVER_URL, SERVER_KEY)
+try:
+    sb: Client=create_client(SERVER_URL, SERVER_KEY)
+except Exception as e:
+    raise SystemExit(f'Supabase configuration error: {e}')
 BOT_ID=None
 last_dm=datetime.now(timezone.utc).isoformat()
 last_room={}
