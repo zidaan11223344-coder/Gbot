@@ -14,13 +14,18 @@
 - إذا كان الماستر يدير عدة غرف: `lang@ar@اسم_الغرفة` أو `lang@en@اسم_الغرفة`
 
 ## المتغيرات
-- GIANT_USERNAME
-- GIANT_PASSWORD
-- SUPABASE_URL
-- SUPABASE_KEY
-- CONTROL_LANGUAGE
-- ROOM_PASSWORD
-- CONTROL_POLL_SECONDS
+- `GIANT_USERNAME`: اسم مستخدم حساب البوت في Giant Chat، من دون `@`.
+- `GIANT_PASSWORD`: كلمة مرور حساب البوت.
+- `SUPABASE_URL`: رابط مشروع Supabase نفسه، مثل `https://project.supabase.co`.
+- `SUPABASE_PUBLISHABLE_KEY`: المفتاح المفضل للمشاريع الجديدة، ويبدأ عادةً بـ `sb_publishable_`.
+- `SUPABASE_KEY`: بديل متوافق مع مفتاح `anon` القديم؛ استخدمه بدلاً من `SUPABASE_PUBLISHABLE_KEY` وليس معه.
+- `CONTROL_LANGUAGE`: `ar` أو `en`.
+- `ROOM_PASSWORD`: كلمة مرور الغرف إذا كانت مطلوبة.
+- `CONTROL_POLL_SECONDS`: فترة الفحص بالثواني، والافتراضي `2`.
+
+> مهم: خطأ `401 Unauthorized` مع `Invalid API key` يعني أن المفتاح الموجود في بيئة النشر غير صحيح أو تابع لمشروع Supabase مختلف. انسخ المفتاح من إعدادات المشروع نفسه، ولا تضع مفتاح `sb_secret_` أو كلمة مرور الحساب في المستودع.
+
+التحديث الإصلاحي يزيل إرسال مفتاح `sb_publishable_*` على أنه JWT في ترويسة `Authorization`، ويتركه في ترويسة `apikey`، ثم يستخدم رمز جلسة المستخدم بعد نجاح تسجيل الدخول.
 
 ## صلاحيات الإضافة
 لا يتم اعتماد البوت في الغرفة إلا إذا كانت رتبته `moderator` أو `admin`. إذا كانت رتبته عضوًا عادياً يتم رفضه وإخراجه.

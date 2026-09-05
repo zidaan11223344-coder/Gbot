@@ -12,8 +12,10 @@ LOG_DIR=BASE/'logs'; LOG_DIR.mkdir(exist_ok=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | control | %(message)s', handlers=[logging.FileHandler(LOG_DIR/'control.log',encoding='utf-8'), logging.StreamHandler()])
 log=logging.getLogger('control')
 
-SERVER_URL=os.environ.get('SUPABASE_URL','').strip()
-SERVER_KEY=os.environ.get('SUPABASE_KEY','').strip()
+SERVER_URL=os.environ.get('SUPABASE_URL','').strip().rstrip('/')
+# SUPABASE_PUBLISHABLE_KEY is preferred for new Supabase projects.
+# SUPABASE_KEY remains supported for legacy deployments.
+SERVER_KEY=(os.environ.get('SUPABASE_PUBLISHABLE_KEY') or os.environ.get('SUPABASE_ANON_KEY') or os.environ.get('SUPABASE_KEY') or '').strip()
 CONTROL_USERNAME=os.environ.get('GIANT_USERNAME','').strip()
 CONTROL_PASSWORD=os.environ.get('GIANT_PASSWORD','')
 DEFAULT_LANG=(os.environ.get('CONTROL_LANGUAGE') or 'ar').strip().lower()
@@ -23,17 +25,18 @@ if not SERVER_URL or not SERVER_KEY or not CONTROL_USERNAME or not CONTROL_PASSW
     raise SystemExit('Missing SUPABASE_URL/SUPABASE_KEY/GIANT_USERNAME/GIANT_PASSWORD')
 
 def create_supabase_client(url, key):
-    # Match the working bot: support modern sb_publishable_* keys.
-    if str(key).startswith("sb_publishable_"):
-        client = create_client(url, "a.b.c")
+    """إنشاء عميل Supabase بنفس طريقة bot.py العامل.
+
+    بعض إصدارات supabase-py تتحقق محلياً من أن المفتاح JWT، بينما
+    sb_publishable_* ليس JWT. لذلك نستخدم JWT شكلياً أثناء الإنشاء، ثم
+    نستبدل رأس API بالمفتاح الحقيقي ونحذف Authorization الخاص بالمفتاح.
+    """
+    if str(key).startswith('sb_publishable_'):
+        client = create_client(url, 'a.b.c')
         client.supabase_key = key
-        try:
-            headers = client.options.headers
-            headers["apikey"] = key
-            # Publishable keys are API keys, not JWT bearer tokens.
-            headers["Authorization"] = f"Bearer {key}"
-        except Exception:
-            pass
+        headers = client.options.headers
+        headers['apiKey'] = key
+        headers.pop('Authorization', None)
         return client
     return create_client(url, key)
 
@@ -104,45 +107,50 @@ async def rpc(name,args):
     return await run(lambda: sb.rpc(name,args).execute().data)
 
 async def resolve_email(client, username):
-    """Resolve Giant username to the internal Giant Auth email mapping."""
-    username = str(username or "").strip()
+    """Resolve Giant Chat username using the same order as the working bot."""
+    username = str(username or '').strip()
     if not username:
-        return ""
+        raise RuntimeError('Giant username is empty')
 
-    normalized = re.sub(r"[^a-z0-9_]", "", username.lower())
-    default_email = f"{normalized}@giant.app" if normalized else ""
+    normalized = re.sub(r'[^a-z0-9_]', '', username.lower())
+    default_email = f'{normalized}@giant.app' if normalized else ''
 
-    # The app's deterministic username -> auth email mapping is the primary path.
-    # It avoids requiring table/RPC read access from a publishable key.
-    if default_email:
-        return default_email
-
+    # First use the app RPC when available; this supports accounts whose
+    # internal auth email is not simply <username>@giant.app.
     try:
-        d = await asyncio.to_thread(
-            lambda: client.rpc("lookup_auth_email", {"_username": username}).execute().data
+        data = await asyncio.to_thread(
+            lambda: client.rpc('lookup_auth_email', {'_username': username}).execute().data
         )
-        if isinstance(d, str) and "@" in d:
-            return d.strip()
-    except Exception:
-        pass
+        if isinstance(data, str) and '@' in data:
+            log.info('Resolved account email through lookup_auth_email')
+            return data.strip()
+    except Exception as exc:
+        log.warning('lookup_auth_email failed; using fallback: %s', str(exc)[:180])
 
+    # Then support older accounts that explicitly store auth_email in profiles.
     try:
         rows = await asyncio.to_thread(
-            lambda: client.table("profiles").select("auth_email")
-            .eq("username", username).limit(1).execute().data or []
+            lambda: client.table('profiles').select('auth_email')
+            .eq('username', username).limit(1).execute().data or []
         )
-        if rows and rows[0].get("auth_email"):
-            return str(rows[0]["auth_email"]).strip()
-    except Exception:
-        pass
+        if rows and rows[0].get('auth_email'):
+            email = str(rows[0]['auth_email']).strip()
+            if '@' in email:
+                log.info('Resolved account email from profiles')
+                return email
+    except Exception as exc:
+        log.warning('profiles email lookup failed: %s', str(exc)[:180])
 
-    return default_email
+    if default_email:
+        log.info('Using default Giant Chat email mapping: %s@giant.app', normalized)
+        return default_email
+    raise RuntimeError('Unable to resolve account email')
 
 async def login_client(username,password):
-    client=create_client(SERVER_URL,SERVER_KEY)
+    client=create_supabase_client(SERVER_URL,SERVER_KEY)
     email=await resolve_email(client,username)
     res=await run(lambda: client.auth.sign_in_with_password({'email':email,'password':password}))
-    if not res or not getattr(res,'user',None): return None, 'login failed'
+    if not res or not getattr(res,'user',None): return None, 'login failed; check Supabase key, email mapping, and password'
     return client, None
 
 async def find_room(client,name):
@@ -515,7 +523,12 @@ async def main():
     global BOT_ID,last_dm
     email=await resolve_email(sb,CONTROL_USERNAME)
     res=await run(lambda: sb.auth.sign_in_with_password({'email':email,'password':CONTROL_PASSWORD}))
-    if not res or not getattr(res,'user',None): raise RuntimeError('Control bot login failed')
+    if not res or not getattr(res,'user',None):
+        raise RuntimeError(
+            'Control bot login failed. If the log says Invalid API key, set a valid '
+            'Supabase publishable/anon key for the same project; if it says invalid '
+            'login credentials, verify GIANT_USERNAME and GIANT_PASSWORD.'
+        )
     BOT_ID=res.user.id; log.info('Control bot connected as @%s',CONTROL_USERNAME)
     # Restart persisted bots automatically.
     for b in load(BOTS_FILE,[]):
