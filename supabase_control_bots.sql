@@ -1,0 +1,3 @@
+-- Optional persistent registry if you prefer DB storage over control_bots.json.
+-- The supplied control bot currently uses control_bots.json so no SQL is required.
+-- If you migrate to DB storage later, protect password rows with strict RLS.

@@ -1,0 +1,2 @@
+supabase==2.15.0
+realtime==2.4.3
