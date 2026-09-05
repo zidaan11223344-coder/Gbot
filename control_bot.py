@@ -22,9 +22,22 @@ POLL=float(os.environ.get('CONTROL_POLL_SECONDS','2'))
 if not SERVER_URL or not SERVER_KEY or not CONTROL_USERNAME or not CONTROL_PASSWORD:
     raise SystemExit('Missing SUPABASE_URL/SUPABASE_KEY/GIANT_USERNAME/GIANT_PASSWORD')
 
-print('SUPABASE_URL=', SERVER_URL)
-print('KEY START=', SERVER_KEY[:30])
-sb: Client=create_client(SERVER_URL, SERVER_KEY)
+def create_supabase_client(url, key):
+    # Match the working bot: support modern sb_publishable_* keys.
+    if str(key).startswith("sb_publishable_"):
+        client = create_client(url, "a.b.c")
+        client.supabase_key = key
+        try:
+            headers = client.options.headers
+            headers["apikey"] = key
+            # Publishable keys are API keys, not JWT bearer tokens.
+            headers["Authorization"] = f"Bearer {key}"
+        except Exception:
+            pass
+        return client
+    return create_client(url, key)
+
+sb: Client=create_supabase_client(SERVER_URL, SERVER_KEY)
 BOT_ID=None
 last_dm=datetime.now(timezone.utc).isoformat()
 last_room={}
@@ -91,16 +104,39 @@ async def rpc(name,args):
     return await run(lambda: sb.rpc(name,args).execute().data)
 
 async def resolve_email(client, username):
-    norm=re.sub(r'[^a-z0-9_]','',username.lower())
+    """Resolve Giant username to the internal Giant Auth email mapping."""
+    username = str(username or "").strip()
+    if not username:
+        return ""
+
+    normalized = re.sub(r"[^a-z0-9_]", "", username.lower())
+    default_email = f"{normalized}@giant.app" if normalized else ""
+
+    # The app's deterministic username -> auth email mapping is the primary path.
+    # It avoids requiring table/RPC read access from a publishable key.
+    if default_email:
+        return default_email
+
     try:
-        d=await asyncio.to_thread(lambda: client.rpc('lookup_auth_email', {'_username':username}).execute().data)
-        if isinstance(d,str) and '@' in d: return d.strip()
-    except Exception: pass
+        d = await asyncio.to_thread(
+            lambda: client.rpc("lookup_auth_email", {"_username": username}).execute().data
+        )
+        if isinstance(d, str) and "@" in d:
+            return d.strip()
+    except Exception:
+        pass
+
     try:
-        rows=await asyncio.to_thread(lambda: client.table('profiles').select('auth_email').eq('username',username).limit(1).execute().data or [])
-        if rows and rows[0].get('auth_email'): return rows[0]['auth_email']
-    except Exception: pass
-    return f'{norm}@giant.app' if norm else ''
+        rows = await asyncio.to_thread(
+            lambda: client.table("profiles").select("auth_email")
+            .eq("username", username).limit(1).execute().data or []
+        )
+        if rows and rows[0].get("auth_email"):
+            return str(rows[0]["auth_email"]).strip()
+    except Exception:
+        pass
+
+    return default_email
 
 async def login_client(username,password):
     client=create_client(SERVER_URL,SERVER_KEY)
