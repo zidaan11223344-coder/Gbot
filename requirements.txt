@@ -1,2 +1,3 @@
-supabase==2.15.0
-realtime==2.4.3
+supabase>=2.16.0
+realtime>=2.4.3
+postgrest>=1.1.1
