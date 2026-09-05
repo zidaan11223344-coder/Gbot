@@ -112,39 +112,15 @@ async def resolve_email(client, username):
     if not username:
         raise RuntimeError('Giant username is empty')
 
+    # Giant Chat's app login accepts username/password, but Supabase Auth
+    # receives the deterministic internal email used by the app.
+    # Do not require the user to know or provide that email.
     normalized = re.sub(r'[^a-z0-9_]', '', username.lower())
-    default_email = f'{normalized}@giant.app' if normalized else ''
-
-    # First use the app RPC when available; this supports accounts whose
-    # internal auth email is not simply <username>@giant.app.
-    try:
-        data = await asyncio.to_thread(
-            lambda: client.rpc('lookup_auth_email', {'_username': username}).execute().data
-        )
-        if isinstance(data, str) and '@' in data:
-            log.info('Resolved account email through lookup_auth_email')
-            return data.strip()
-    except Exception as exc:
-        log.warning('lookup_auth_email failed; using fallback: %s', str(exc)[:180])
-
-    # Then support older accounts that explicitly store auth_email in profiles.
-    try:
-        rows = await asyncio.to_thread(
-            lambda: client.table('profiles').select('auth_email')
-            .eq('username', username).limit(1).execute().data or []
-        )
-        if rows and rows[0].get('auth_email'):
-            email = str(rows[0]['auth_email']).strip()
-            if '@' in email:
-                log.info('Resolved account email from profiles')
-                return email
-    except Exception as exc:
-        log.warning('profiles email lookup failed: %s', str(exc)[:180])
-
-    if default_email:
-        log.info('Using default Giant Chat email mapping: %s@giant.app', normalized)
-        return default_email
-    raise RuntimeError('Unable to resolve account email')
+    if not normalized:
+        raise RuntimeError('Unable to resolve Giant username')
+    email = f'{normalized}@giant.app'
+    log.info('Using Giant username mapping for authentication: %s -> internal email', username)
+    return email
 
 async def login_client(username,password):
     client=create_supabase_client(SERVER_URL,SERVER_KEY)
