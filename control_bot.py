@@ -21,6 +21,7 @@ CONTROL_PASSWORD=os.environ.get('GIANT_PASSWORD','')
 DEFAULT_LANG=(os.environ.get('CONTROL_LANGUAGE') or 'ar').strip().lower()
 ROOM_PASSWORD=os.environ.get('ROOM_PASSWORD','')
 POLL=float(os.environ.get('CONTROL_POLL_SECONDS','2'))
+CONTROL_BOT_VERSION='username-login-v3'
 if not SERVER_URL or not SERVER_KEY or not CONTROL_USERNAME or not CONTROL_PASSWORD:
     raise SystemExit('Missing SUPABASE_URL/SUPABASE_KEY/GIANT_USERNAME/GIANT_PASSWORD')
 
@@ -497,13 +498,27 @@ async def room_loop():
 
 async def main():
     global BOT_ID,last_dm
+    log.info('Starting control bot version %s', CONTROL_BOT_VERSION)
     email=await resolve_email(sb,CONTROL_USERNAME)
-    res=await run(lambda: sb.auth.sign_in_with_password({'email':email,'password':CONTROL_PASSWORD}))
+    try:
+        # Keep the public configuration as username/password. The email here
+        # is only the internal Supabase mapping and is never requested from the user.
+        res=await asyncio.to_thread(
+            lambda: sb.auth.sign_in_with_password(
+                {'email': email, 'password': CONTROL_PASSWORD}
+            )
+        )
+    except Exception as exc:
+        # Do not hide the actual Supabase response behind a generic line-503 error.
+        log.error('Supabase login failed for username %s: %s', CONTROL_USERNAME, exc)
+        raise RuntimeError(
+            'Control bot login failed: Supabase rejected the username/password. '
+            'Check GIANT_USERNAME and GIANT_PASSWORD in the deployment variables.'
+        ) from exc
     if not res or not getattr(res,'user',None):
         raise RuntimeError(
-            'Control bot login failed. If the log says Invalid API key, set a valid '
-            'Supabase publishable/anon key for the same project; if it says invalid '
-            'login credentials, verify GIANT_USERNAME and GIANT_PASSWORD.'
+            'Control bot login failed: Supabase returned no user. '
+            'Check GIANT_USERNAME and GIANT_PASSWORD in the deployment variables.'
         )
     BOT_ID=res.user.id; log.info('Control bot connected as @%s',CONTROL_USERNAME)
     # Restart persisted bots automatically.
