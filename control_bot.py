@@ -270,12 +270,19 @@ async def add_bot(username,password,room_name,role='main',master_id='',master_na
     except Exception: pass
     task=asyncio.create_task(child_runner(rec),name=f'bot-{username}')
     child_tasks[bid]=task
-    # Only the person who creates the first successful bot for a room gets
-    # the initial language prompt; that person is the primary room master.
-    if is_first_bot:
+    # Send the language chooser whenever this master has no saved choice yet.
+    # This also repairs rooms whose old masters.json predates language.json.
+    lang_state=language_state()
+    has_language=(str(room['id']) in lang_state.get('rooms',{})) or (str(master_id) in lang_state.get('users',{}))
+    prompt_sent=False
+    if not has_language:
         set_pending_language(master_id, room['id'], room['name'])
-        await send_dm(master_id, language_prompt(room['name']))
-    return L(f'✅ تمت إضافة @{username} تلقائياً إلى غرفة {room["name"]}.\n🤖 النوع: {"Main Bot" if role=="main" else "Hang Bot"}'+('\n📩 تم إرسال اختيار اللغة إلى خاصك.' if is_first_bot else ''),f'✅ @{username} was automatically added to {room["name"]}.\n🤖 Type: {"Main Bot" if role=="main" else "Hang Bot"}'+('\n📩 Language selection was sent to your DM.' if is_first_bot else ''))
+        prompt_sent=await send_dm(master_id, language_prompt(room['name']))
+        if not prompt_sent:
+            log.error('Language prompt could not be delivered to master %s for room %s', master_id, room['name'])
+    language_note='\n📩 تم إرسال اختيار اللغة إلى خاصك.' if prompt_sent else ''
+    language_note_en='\n📩 Language selection was sent to your DM.' if prompt_sent else ''
+    return L(f'✅ تمت إضافة @{username} تلقائياً إلى غرفة {room["name"]}.\n🤖 النوع: {"Main Bot" if role=="main" else "Hang Bot"}'+language_note,f'✅ @{username} was automatically added to {room["name"]}.\n🤖 Type: {"Main Bot" if role=="main" else "Hang Bot"}'+language_note_en)
 
 async def remove_bot(rec):
     task=child_tasks.pop(rec['id'],None)
@@ -376,16 +383,24 @@ async def control_action(sender,text):
         return 'تم تغيير لغة بوت التحكم إلى العربية.' if v=='ar' else 'Control bot language changed to English.'
 
     sender_name=(await username_of(sender)).strip().lstrip('@')
-    if '@' in t and not low.startswith(('room@','del@','delall@','clean@','lang@','لغة@','hb@','master@','delmaster@','masters@')):
-        parts=t.split('@')
-        if len(parts)>=3:
-            room=parts[-1].strip(); password=parts[-2].strip(); username='@'.join(parts[:-2]).strip().lstrip('@')
-            if username and password and room: return await add_bot(username,password,room,'main',str(sender),sender_name)
+    # Format: username@password@room. Parse from the right so password may
+    # contain @, e.g. username@gag@998877@Room Name.
+    excluded=('room@','del@','delall@','clean@','lang@','لغة@','hb@','master@','delmaster@','masters@')
+    if '@' in t and not low.startswith(excluded):
+        payload, room = t.rsplit('@', 1)
+        if '@' in payload:
+            username, password = payload.split('@', 1)
+            username=username.strip().lstrip('@'); password=password.strip(); room=room.strip()
+            if username and password and room:
+                return await add_bot(username,password,room,'main',str(sender),sender_name)
     if low.startswith('hb@'):
-        parts=t.split('@',3)
-        if len(parts)==4:
-            _,username,password,room=parts
-            return await add_bot(username.strip().lstrip('@'),password.strip(),room.strip(),'hang',str(sender),sender_name)
+        payload=t[3:]
+        if '@' in payload:
+            payload, room = payload.rsplit('@', 1)
+            if '@' in payload:
+                username, password = payload.split('@', 1)
+                if username.strip() and password.strip() and room.strip():
+                    return await add_bot(username.strip().lstrip('@'),password.strip(),room.strip(),'hang',str(sender),sender_name)
     if low.startswith('delall@'):
         room=t.split('@',1)[1].strip(); ok,room_obj,msg=await authorized_for_room(sender,room)
         if not ok: return msg
@@ -478,6 +493,41 @@ async def control_action(sender,text):
         return L(f'🧹 تم تنظيف ذاكرة التحكم الخاصة بالغرفة {room}.',f'🧹 Control memory for {room} was cleaned.')
     return L('❓ أمر غير معروف. اكتب help.','❓ Unknown command. Type help.')
 
+async def accept_pending_friend_requests():
+    """Accept every pending incoming friendship request for the control bot."""
+    rows=await asyncio.to_thread(lambda: sb.table('friendships').select('id,requester_id,addressee_id,status').eq('addressee_id',str(BOT_ID)).eq('status','pending').limit(100).execute().data or [])
+    for row in rows:
+        request_id=row.get('id'); requester=row.get('requester_id')
+        if not request_id or not requester:
+            continue
+        updated=await run(lambda rid=request_id: sb.table('friendships').update({'status':'accepted'}).eq('id',rid).eq('status','pending').execute().data)
+        if updated is None:
+            log.warning('Could not accept friendship request %s from %s',request_id,requester)
+            continue
+        # Store a control-level language choice for the new friend.
+        state=language_state()
+        if str(requester) not in state.get('users',{}):
+            set_pending_language(requester,'__control__','بوت التحكم')
+            await send_dm(requester, language_prompt('بوت التحكم'))
+        log.info('Accepted friendship request %s from %s',request_id,requester)
+
+async def friend_loop():
+    while True:
+        try:
+            await accept_pending_friend_requests()
+        except Exception:
+            log.exception('friend request loop failed')
+        await asyncio.sleep(POLL)
+
+async def presence_loop():
+    """Keep the control bot online using the same profiles.last_seen_at field as the app."""
+    while True:
+        try:
+            await run(lambda: sb.table('profiles').update({'last_seen_at':now()}).eq('id',str(BOT_ID)).execute().data)
+        except Exception:
+            log.exception('presence update failed')
+        await asyncio.sleep(25)
+
 async def dm_loop():
     global last_dm
     while True:
@@ -526,7 +576,7 @@ async def main():
         try:
             task=asyncio.create_task(child_runner(b),name=f'bot-{b.get("username")}'); child_tasks[b['id']]=task
         except Exception: log.exception('child start failed')
-    await dm_loop()
+    await asyncio.gather(dm_loop(), friend_loop(), presence_loop(), room_loop())
 
 if __name__=='__main__':
     try: asyncio.run(main())
