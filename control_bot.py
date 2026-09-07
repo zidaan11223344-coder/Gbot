@@ -185,8 +185,338 @@ async def announce(client, room_id, text):
             await asyncio.to_thread(lambda: client.table('room_messages').insert({'room_id':room_id,'user_id':uid,'content':text,'message_type':'text'}).execute())
     except Exception: pass
 
+
+# ============================================================================
+# [قسم تحكم الغرف المنقول من bot.py] BEGIN
+# ============================================================================
+
+ROOM_CONTROL_STATE = BASE / "room_control_state.json"
+ROOM_REPLIES_STATE = BASE / "room_replies.json"
+ROOM_WELCOME_STATE = BASE / "room_welcome.json"
+
+def norm(s):
+    v=str(s or "").strip().lower()
+    v=re.sub(r"[\u064b-\u065f\u0670\u0640]", "", v)
+    v=v.replace("ـ","")
+    return re.sub(r"\s+", " ", v)
+
+def _room_state():
+    x=load(ROOM_CONTROL_STATE,{})
+    return x if isinstance(x,dict) else {}
+
+def _save_room_state(x): save(ROOM_CONTROL_STATE,x)
+
+def _room_replies():
+    x=load(ROOM_REPLIES_STATE,{})
+    return x if isinstance(x,dict) else {}
+
+def _save_room_replies(x): save(ROOM_REPLIES_STATE,x)
+
+def _room_welcome():
+    x=load(ROOM_WELCOME_STATE,{})
+    return x if isinstance(x,dict) else {}
+
+def _save_room_welcome(x): save(ROOM_WELCOME_STATE,x)
+
+async def room_username(client, uid):
+    try:
+        rows=await asyncio.to_thread(lambda: client.table('profiles').select('username').eq('id',str(uid)).limit(1).execute().data or [])
+        return str(rows[0].get('username') or uid) if rows else str(uid)
+    except Exception:
+        return str(uid)
+
+async def child_profile(client, username):
+    clean=str(username or "").strip().lstrip("@")
+    if not clean: return None
+    try:
+        rows=await asyncio.to_thread(lambda: client.table('profiles').select('id,username').eq('username',clean).limit(1).execute().data or [])
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+async def child_rpc(client, name, args):
+    try:
+        return await asyncio.to_thread(lambda: client.rpc(name,args).execute().data)
+    except Exception as exc:
+        log.warning("room control rpc %s failed: %s", name, exc)
+        return None
+
+async def child_send_room(client, room_id, text):
+    if not text: return False
+    uid=client_user_id(client)
+    if not uid: return False
+    envelope={'v':1,'id':str(uuid.uuid4()),'content':str(text),'message_type':'text',
+              'media_url':None,'media_duration_ms':None,'reply_to_id':None,'created_at':now()}
+    try:
+        await asyncio.to_thread(lambda: client.table('room_messages').insert({
+            'room_id':room_id,'user_id':uid,'content':str(text),'message_type':'text'
+        }).execute())
+        return True
+    except Exception:
+        return False
+
+async def child_is_room_master(client, room_id, uid):
+    # Room master is the owner/delegate stored by the control bot.
+    rec=load(MASTERS_FILE,{}).get(str(room_id))
+    if not rec: return False
+    sid=str(uid)
+    return sid == str(rec.get('master_id','')) or sid in [str(x) for x in (rec.get('masters') or [])]
+
+async def child_target_id(client, username):
+    p=await child_profile(client,username)
+    return (str(p.get('id')), p.get('username') or username) if p else (None,None)
+
+async def child_moderate(client, room_id, action, target_username, minutes=0):
+    tid,tname=await child_target_id(client,target_username)
+    if not tid:
+        return False, f"❌ المستخدم @{str(target_username).lstrip('@')} غير موجود."
+    if tid == client_user_id(client):
+        return False, "❌ لا يمكن للبوت تنفيذ الإجراء على نفسه."
+    if action == 'kick':
+        data=await child_rpc(client,'kick_room_member',{'_room':room_id,'_user':tid})
+    elif action == 'ban':
+        data=await child_rpc(client,'ban_room_member',{'_room':room_id,'_user':tid,'_reason':'إجراء إداري عبر بوت التحكم'})
+    elif action == 'mute':
+        # Use temporary local mute + server-side rank/member action when available.
+        data=await child_rpc(client,'mute_room_member',{'_room':room_id,'_user':tid,'_minutes':int(minutes or 5)})
+    elif action == 'rank':
+        data=await child_rpc(client,'set_member_rank',{'_room':room_id,'_user':tid,'_new_rank':'moderator'})
+    else:
+        return False, "❌ إجراء غير مدعوم."
+    if data is None:
+        return False, "❌ رفض Giant الإجراء أو لم تُرجع قاعدة البيانات نتيجة."
+    return True, tname
+
+def child_filter_words(room_id):
+    st=_room_state()
+    item=st.setdefault(str(room_id),{'filter':False,'words':[],'muted':{},'pending':{}})
+    return item
+
+async def child_handle_admin(client, rec, room_id, sender_id, text, from_dm=False):
+    t=str(text or "").strip()
+    low=norm(t)
+    if not t: return None
+    sender_name=await room_username(client,sender_id)
+
+    # In-room commands may be used by the room master/delegates.
+    # In DM, only the room master/delegates linked to this room may control it.
+    if not await child_is_room_master(client, room_id, sender_id):
+        if from_dm:
+            return "🚫 هذا البوت يقبل أوامر هذه الغرفة من الماستر المعيّن فقط."
+        return None
+
+    state=child_filter_words(room_id)
+    replies=_room_replies()
+    welcome=_room_welcome()
+
+    # Help
+    if low in ('help','مساعدة','الاوامر','الأوامر'):
+        return L(
+            "🛡️ أوامر التحكم:\n"
+            "حظر → ثم اسم المستخدم\n"
+            "طرد → ثم اسم المستخدم\n"
+            "كتم → ثم اسم المستخدم ثم المدة بالدقائق\n"
+            "فك الكتم → ثم اسم المستخدم\n"
+            "+mf@كلمة | -mf@كلمة\n"
+            "mf@on / mf@off / l@mf / clear@mf\n"
+            "+r@كلمة@الرد\n"
+            "lr — عرض الردود\n"
+            "cr@كلمة — حذف رد\n"
+            "+wc نص الترحيب\n"
+            "wc@on / wc@off / l@wc / clear@wc\n"
+            "صلاحياتي\n"
+            "حالة البوت",
+            "🛡️ Control commands:\n"
+            "حظر / طرد / كتم / فك الكتم\n"
+            "+mf@word / -mf@word\n"
+            "mf@on / mf@off / l@mf / clear@mf\n"
+            "+r@word@reply / lr / cr@word\n"
+            "+wc welcome / wc@on / wc@off / l@wc / clear@wc\n"
+            "صلاحياتي / حالة البوت"
+        )
+
+    # Interactive moderation like bot.py.
+    pending=state.setdefault('pending',{})
+    if low in ('حظر','طرد','كتم','فك الكتم','فك_الكتم','unmute'):
+        pending[str(sender_id)]={'action':('ban' if low=='حظر' else 'kick' if low=='طرد' else 'mute' if low=='كتم' else 'unmute'),'created_at':time.time()}
+        return f"✍️ أرسل اسم المستخدم لتنفيذ «{t}»."
+
+    if str(sender_id) in pending and time.time()-float(pending[str(sender_id)].get('created_at',0)) <= 120 and low not in ('الغاء','إلغاء','cancel'):
+        p=pending[str(sender_id)]
+        # only treat non-command text as the target for interactive mode
+        if '@' not in t and not low.startswith(('+mf','-mf','mf@','+r@','+wc','wc@','l@','clear@','صلاحيات','حالة')):
+            target=t.lstrip('@').split()[0]
+            pending.pop(str(sender_id),None)
+            if p['action']=='mute':
+                parts=t.split()
+                target=parts[0].lstrip('@')
+                minutes=int(parts[1]) if len(parts)>1 and parts[1].isdigit() else 5
+                ok,msg=await child_moderate(client,room_id,'mute',target,minutes)
+            elif p['action']=='unmute':
+                tid,tname=await child_target_id(client,target)
+                ok,msg=(False,"المستخدم غير موجود.") if not tid else (True,tname)
+                if ok:
+                    rs=child_filter_words(room_id); rs.setdefault('muted',{}).pop(str(tid),None); _save_room_state(_room_state())
+                    data=await child_rpc(client,'unmute_room_member',{'_room':room_id,'_user':tid})
+                    if data is None: ok=False; msg="رفض Giant فك الكتم."
+            else:
+                ok,msg=await child_moderate(client,room_id,p['action'],target)
+            return (f"✅ تم تنفيذ الأمر على @{msg}." if ok else str(msg))
+
+    if low.startswith('حظر@') or low.startswith('ban@'):
+        target=t.split('@',1)[1].strip()
+        ok,msg=await child_moderate(client,room_id,'ban',target)
+        return f"✅ تم حظر @{msg}." if ok else msg
+    if low.startswith('طرد@') or low.startswith('kick@'):
+        target=t.split('@',1)[1].strip()
+        ok,msg=await child_moderate(client,room_id,'kick',target)
+        return f"✅ تم طرد @{msg}." if ok else msg
+    if low.startswith('كتم@') or low.startswith('mute@'):
+        parts=t.split('@',2); target=parts[1].strip() if len(parts)>1 else ""
+        minutes=int(parts[2]) if len(parts)>2 and parts[2].strip().isdigit() else 5
+        ok,msg=await child_moderate(client,room_id,'mute',target,minutes)
+        return f"✅ تم كتم @{msg} لمدة {minutes} دقيقة." if ok else msg
+    if low.startswith('فك@') or low.startswith('فك الكتم@') or low.startswith('unmute@'):
+        target=t.split('@',1)[1].strip()
+        tid,tname=await child_target_id(client,target)
+        if not tid: return "❌ المستخدم غير موجود."
+        rs=child_filter_words(room_id); rs.setdefault('muted',{}).pop(str(tid),None); _save_room_state(_room_state())
+        data=await child_rpc(client,'unmute_room_member',{'_room':room_id,'_user':tid})
+        return f"✅ تم فك الكتم عن @{tname}." if data is not None else "❌ تعذر فك الكتم."
+
+    # Word filter, exactly matching bot.py style.
+    if low in ('mf@on','mf on'):
+        state['filter']=True; _save_room_state(_room_state()); return "✅ تم تفعيل فلتر الألفاظ."
+    if low in ('mf@off','mf off'):
+        state['filter']=False; _save_room_state(_room_state()); return "⛔ تم تعطيل فلتر الألفاظ."
+    if low=='clear@mf':
+        state['words']=[]; _save_room_state(_room_state()); return "🧹 تم حذف جميع الكلمات الممنوعة."
+    if low=='l@mf':
+        return "🚫 الكلمات الممنوعة:\n"+("\n".join(f"{i+1}. {w}" for i,w in enumerate(state.get('words',[]))) if state.get('words') else "لا توجد كلمات.")
+    if low.startswith('+mf@'):
+        w=t.split('@',1)[1].strip()
+        if not w: return "❌ الصيغة: +mf@كلمة"
+        if w not in state.setdefault('words',[]): state['words'].append(w)
+        _save_room_state(_room_state()); return f"✅ تمت إضافة الكلمة الممنوعة: {w}"
+    if low.startswith('-mf@'):
+        w=t.split('@',1)[1].strip()
+        state['words']=[x for x in state.get('words',[]) if norm(x)!=norm(w)]
+        _save_room_state(_room_state()); return f"✅ تمت إزالة الكلمة: {w}"
+
+    # Custom replies.
+    room_rep=replies.setdefault(str(room_id),{})
+    if low.startswith('+r@'):
+        parts=t.split('@',2)
+        if len(parts)<3: return "❌ الصيغة: +r@الكلمة@الرد"
+        room_rep[parts[1].strip()]=parts[2].strip(); _save_room_replies(replies)
+        return f"✅ تم إضافة الرد للكلمة: {parts[1].strip()}"
+    if low=='lr':
+        return "💬 الردود:\n"+("\n".join(f"• {k} → {v}" for k,v in room_rep.items()) if room_rep else "لا توجد ردود.")
+    if low.startswith('cr@'):
+        k=t.split('@',1)[1].strip(); room_rep.pop(k,None); _save_room_replies(replies)
+        return f"✅ تم حذف الرد: {k}"
+
+    # Welcome.
+    if low.startswith('+wc '):
+        msg=t.split(' ',1)[1].strip()
+        item=welcome.setdefault(str(room_id),{'enabled':False,'messages':[]})
+        if msg not in item['messages']: item['messages'].append(msg)
+        _save_room_welcome(welcome); return "✅ تمت إضافة رسالة الترحيب."
+    if low=='clear@wc':
+        welcome.pop(str(room_id),None); _save_room_welcome(welcome); return "🧹 تم حذف رسائل الترحيب."
+    if low=='l@wc':
+        msgs=welcome.get(str(room_id),{}).get('messages',[])
+        return "👋 رسائل الترحيب:\n"+("\n".join(f"{i+1}. {m}" for i,m in enumerate(msgs)) if msgs else "لا توجد رسائل.")
+    if low in ('wc@on','wc on'):
+        welcome.setdefault(str(room_id),{'enabled':False,'messages':[]})['enabled']=True; _save_room_welcome(welcome); return "✅ تم تفعيل رسائل الترحيب."
+    if low in ('wc@off','wc off'):
+        welcome.setdefault(str(room_id),{'enabled':False,'messages':[]})['enabled']=False; _save_room_welcome(welcome); return "⛔ تم تعطيل رسائل الترحيب."
+
+    if low in ('صلاحياتي','modstatus','حالة البوت'):
+        rank=await member_rank(client,room_id,client_user_id(client)) or 'unknown'
+        return f"🤖 رتبة البوت: {rank}\n👤 @{sender_name} هو ماستر الغرفة: نعم"
+
+    # Normal configured reply.
+    if t in room_rep:
+        return room_rep[t]
+
+    # Filter incoming normal messages before they fall through.
+    if state.get('filter'):
+        nt=norm(t); compact=nt.replace(' ','')
+        for w in state.get('words',[]):
+            nw=norm(w); cw=nw.replace(' ','')
+            if nw and (nw in nt or (cw and cw in compact)):
+                tid,tname=await child_target_id(client,sender_name)
+                if tid and str(sender_id)!=str(tid):
+                    ok,msg=await child_moderate(client,room_id,'ban',sender_name)
+                    return "🚫 تم حظر الحساب بسبب كلمة محظورة." if ok else f"⚠️ تم اكتشاف الكلمة لكن تعذر الحظر: {msg}"
+
+    return None
+
+async def child_room_loop(rec):
+    client=child_clients.get(rec['id'])
+    room_id=rec.get('room_id')
+    if not client or not room_id: return
+    cursor=now()
+    while True:
+        try:
+            rows=await asyncio.to_thread(
+                lambda: client.table('room_messages').select('*')
+                .eq('room_id',room_id).gt('created_at',cursor)
+                .order('created_at').limit(50).execute().data or []
+            )
+            for m in rows:
+                cursor=m.get('created_at') or cursor
+                uid=m.get('user_id')
+                if not uid or str(uid)==str(client_user_id(client)) or m.get('message_type')=='system':
+                    continue
+                text=str(m.get('content') or '').strip()
+                reply=await child_handle_admin(client,rec,room_id,str(uid),text,from_dm=False)
+                if reply:
+                    await child_send_room(client,room_id,reply)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception('child room loop failed for %s',rec.get('username'))
+        await asyncio.sleep(max(1.0,POLL))
+
+async def child_dm_loop(rec):
+    client=child_clients.get(rec['id'])
+    room_id=rec.get('room_id')
+    if not client: return
+    last=now()
+    child_id=client_user_id(client)
+    while True:
+        try:
+            rows=await asyncio.to_thread(
+                lambda: client.table('dm_relay').select('*')
+                .eq('recipient_id',str(child_id)).gt('created_at',last)
+                .order('created_at').limit(50).execute().data or []
+            )
+            for row in rows:
+                last=row.get('created_at') or last
+                sender=row.get('sender_id'); env=row.get('envelope') or {}
+                text=str(env.get('content') or '').strip()
+                if not sender or not text or str(sender)==str(child_id): continue
+                reply=await child_handle_admin(client,rec,room_id,str(sender),text,from_dm=True)
+                if reply:
+                    await asyncio.to_thread(lambda s=sender,e={
+                        'v':1,'id':str(uuid.uuid4()),'content':reply,'message_type':'text',
+                        'media_url':None,'media_duration_ms':None,'reply_to_id':None,'created_at':now()
+                    }: client.table('dm_relay').insert({'sender_id':child_id,'recipient_id':str(s),'envelope':e}).execute())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception('child dm loop failed for %s',rec.get('username'))
+        await asyncio.sleep(max(1.0,POLL))
+
+# ============================================================================
+# [قسم تحكم الغرف المنقول من bot.py] END
+# ============================================================================
+
 async def child_runner(rec):
-    bid=rec['id']; username=rec['username']; password=rec['password']; role=rec.get('role','main'); room_id=rec.get('room_id'); room_name=rec.get('room_name','')
+    bid=rec['id']; username=rec['username']; password=rec['password']
+    role=rec.get('role','main'); room_id=rec.get('room_id'); room_name=rec.get('room_name','')
     client,err=await login_client(username,password)
     if err:
         rec['status']='error'; rec['error']=err; save(BOTS_FILE, load(BOTS_FILE,[])); return
@@ -194,26 +524,60 @@ async def child_runner(rec):
     rec['status']='online'; rec['updated_at']=now(); save(BOTS_FILE,load(BOTS_FILE,[]))
     try:
         room={'id':room_id,'name':room_name}
-        await join_bot(client,room)
-        ready, rank = await require_bot_admin(client, room)
-        if not ready:
-            rec['status']='error'
-            rec['error']=f'bot rank is {rank}; moderator/admin required'
-            save(BOTS_FILE,load(BOTS_FILE,[]))
-            try: await leave_bot(client,room_id)
-            except Exception: pass
-            return
-        rec['rank']=rank; rec['status']='online'; rec['updated_at']=now(); save(BOTS_FILE,load(BOTS_FILE,[]))
-        while True:
-            # If the room removes the bot's moderation rank, stop managing it.
-            current_rank = await member_rank(client, room_id, client_user_id(client))
-            if current_rank not in BOT_ALLOWED_RANKS:
-                rec['status']='error'; rec['error']=f'bot rank changed to {current_rank or "unknown"}; moderator/admin required'
+        joined=await join_bot(client,room)
+        if joined is None:
+            rec['status']='error'; rec['error']='room_join failed'
+            save(BOTS_FILE,load(BOTS_FILE,[])); return
+
+        rank = await member_rank(client, room_id, client_user_id(client))
+        rec['rank']=rank or 'unknown'
+        # Only the Main control bot must have Moderator/Admin rights.
+        # Hang/silent bots are allowed regardless of their current rank.
+        if role == 'main':
+            ready, rank = await require_bot_admin(client, room)
+            if not ready:
+                rec['status']='error'
+                rec['error']=f'bot rank is {rank}; moderator/admin required'
                 save(BOTS_FILE,load(BOTS_FILE,[]))
-                break
-            await heartbeat_bot(client,room_id)
-            await asyncio.sleep(15)
-    except asyncio.CancelledError: pass
+                try: await leave_bot(client,room_id)
+                except Exception: pass
+                return
+
+        rec['rank']=rank or rec.get('rank') or 'unknown'
+        rec['status']='online'; rec['updated_at']=now(); save(BOTS_FILE,load(BOTS_FILE,[]))
+
+        room_task = None
+        dm_task = None
+        # Main bot is the only room controller. Hang bots stay silent.
+        if role == 'main':
+            room_task = asyncio.create_task(child_room_loop(rec), name=f'room-{username}')
+            dm_task = asyncio.create_task(child_dm_loop(rec), name=f'dm-{username}')
+        try:
+            while True:
+                # Main controller must remain Moderator/Admin. Silent bots keep running
+                # even as normal member/visitor.
+                if role == 'main':
+                    current_rank = await member_rank(client, room_id, client_user_id(client))
+                    if current_rank not in BOT_ALLOWED_RANKS:
+                        rec['status']='error'
+                        rec['error']=f'bot rank changed to {current_rank or "unknown"}; moderator/admin required'
+                        save(BOTS_FILE,load(BOTS_FILE,[]))
+                        break
+                    rec['rank']=current_rank
+                else:
+                    rec['rank'] = await member_rank(client, room_id, client_user_id(client)) or rec.get('rank') or 'unknown'
+                await heartbeat_bot(client,room_id)
+                await asyncio.sleep(15)
+        finally:
+            for task in (room_task, dm_task):
+                if task:
+                    task.cancel()
+            for task in (room_task, dm_task):
+                if task:
+                    try: await task
+                    except asyncio.CancelledError: pass
+    except asyncio.CancelledError:
+        pass
     except Exception as e:
         rec['status']='error'; rec['error']=str(e)[:240]
     finally:
@@ -253,6 +617,8 @@ async def add_bot(username,password,room_name,role='main',master_id='',master_na
         allowed=[str(current.get('master_id',''))] + [str(x) for x in (current.get('masters') or [])]
         if sid not in allowed:
             return L(f'🚫 هذه الغرفة مرتبطة بالماستر @{current.get("master_name","")} والماسترات المضافين فقط.', f'🚫 This room is controlled by @{current.get("master_name","")} and its added masters only.')
+        if role == 'main' and any(str(b.get('room_id')) == room_key and b.get('role','main') == 'main' for b in bots):
+            return L('⚠️ يوجد بالفعل بوت تحكم واحد لهذه الغرفة.', '⚠️ This room already has one Main control bot.')
     # Verify credentials immediately: automatic acceptance only after successful login.
     client,err=await login_client(username,password)
     if err: return L('❌ بيانات البوت غير صحيحة أو تعذر تسجيل الدخول.','❌ Bot credentials are invalid or login failed.')
