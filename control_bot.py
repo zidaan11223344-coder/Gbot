@@ -1,9 +1,12 @@
 import os, json, uuid, asyncio, logging, re
 from pathlib import Path
+from dotenv import load_dotenv
 from datetime import datetime, timezone
 from supabase import create_client, Client
 
 BASE=Path(__file__).resolve().parent
+# Read variables from .env; existing environment variables remain supported.
+load_dotenv(BASE/'.env', override=False)
 STATE=BASE/'control_state.json'
 BOTS_FILE=BASE/'control_bots.json'
 MASTERS_FILE=BASE/'room_masters.json'
@@ -256,11 +259,22 @@ async def child_send_room(client, room_id, text):
         return False
 
 async def child_is_room_master(client, room_id, uid):
-    # Room master is the owner/delegate stored by the control bot.
+    # Allow the configured room master/delegates, and also the room's
+    # owner/admin/moderator. This keeps the stored master rule intact while
+    # preventing the speaking bot from silently ignoring moderation commands
+    # when the sender's room identity is authoritative on Giant.
     rec=load(MASTERS_FILE,{}).get(str(room_id))
-    if not rec: return False
     sid=str(uid)
-    return sid == str(rec.get('master_id','')) or sid in [str(x) for x in (rec.get('masters') or [])]
+    if rec:
+        if sid == str(rec.get('master_id','')) or sid in [str(x) for x in (rec.get('masters') or [])]:
+            return True
+    try:
+        rank=await member_rank(client, room_id, sid)
+        if rank in {'owner','admin','moderator'}:
+            return True
+    except Exception:
+        pass
+    return False
 
 async def child_target_id(client, username):
     p=await child_profile(client,username)
@@ -362,6 +376,24 @@ async def child_handle_admin(client, rec, room_id, sender_id, text, from_dm=Fals
             else:
                 ok,msg=await child_moderate(client,room_id,p['action'],target)
             return (f"✅ تم تنفيذ الأمر على @{msg}." if ok else str(msg))
+
+    # Direct moderation syntax also accepts spaces: حظر @user / طرد @user / كتم @user 5
+    if low.startswith('حظر ') or low.startswith('ban '):
+        target=t.split(None,1)[1].strip().lstrip('@') if len(t.split(None,1))>1 else ''
+        if not target: return 'استخدم: حظر @اسم_المستخدم'
+        ok,msg=await child_moderate(client,room_id,'ban',target)
+        return f'✅ تم حظر @{msg}.' if ok else msg
+    if low.startswith('طرد ') or low.startswith('kick '):
+        target=t.split(None,1)[1].strip().lstrip('@') if len(t.split(None,1))>1 else ''
+        if not target: return 'استخدم: طرد @اسم_المستخدم'
+        ok,msg=await child_moderate(client,room_id,'kick',target)
+        return f'✅ تم طرد @{msg}.' if ok else msg
+    if low.startswith('كتم ') or low.startswith('mute '):
+        parts=t.split()
+        if len(parts)<2: return 'استخدم: كتم @اسم_المستخدم [الدقائق]'
+        target=parts[1].lstrip('@'); minutes=int(parts[2]) if len(parts)>2 and parts[2].isdigit() else 5
+        ok,msg=await child_moderate(client,room_id,'mute',target,minutes)
+        return f'✅ تم كتم @{msg} لمدة {minutes} دقيقة.' if ok else msg
 
     if low.startswith('حظر@') or low.startswith('ban@'):
         target=t.split('@',1)[1].strip()
@@ -617,21 +649,33 @@ async def add_bot(username,password,room_name,role='main',master_id='',master_na
         allowed=[str(current.get('master_id',''))] + [str(x) for x in (current.get('masters') or [])]
         if sid not in allowed:
             return L(f'🚫 هذه الغرفة مرتبطة بالماستر @{current.get("master_name","")} والماسترات المضافين فقط.', f'🚫 This room is controlled by @{current.get("master_name","")} and its added masters only.')
-        if role == 'main' and any(str(b.get('room_id')) == room_key and b.get('role','main') == 'main' for b in bots):
-            return L('⚠️ يوجد بالفعل بوت تحكم واحد لهذه الغرفة.', '⚠️ This room already has one Main control bot.')
+        existing_main=next((b for b in bots
+                            if str(b.get('room_id')) == room_key
+                            and b.get('role','main') == 'main'), None)
+        if existing_main and role == 'main':
+            return L('⚠️ يوجد بالفعل بوت أساسي متحكم في الغرفة. لا يمكن إضافة بوت تحكم ثانٍ.', '⚠️ This room already has a Main control bot.')
+        # If the exact Main controller is submitted again through hb@, reject it.
+        # Other bots may still be added as silent bots to the same room.
+        if existing_main and role == 'hang' and str(existing_main.get('username','')).lstrip('@').lower() == str(username).lstrip('@').lower():
+            return L(f'🚫 البوت @{str(username).lstrip("@")} هو بوت أساسي متحكم في غرفة «{room.get("name",room_name)}»، ولا يمكن إدخاله كبوت صامت.',
+                     f'🚫 @{str(username).lstrip("@")} is already the Main control bot for room «{room.get("name",room_name)}» and cannot be added as a silent bot.')
     # Verify credentials immediately: automatic acceptance only after successful login.
     client,err=await login_client(username,password)
     if err: return L('❌ بيانات البوت غير صحيحة أو تعذر تسجيل الدخول.','❌ Bot credentials are invalid or login failed.')
     try: await join_bot(client,room)
     except Exception: return L('❌ تعذر إدخال البوت إلى الغرفة.','❌ Could not join the room.')
-    ready, rank = await require_bot_admin(client, room)
-    if not ready:
-        try: await leave_bot(client, room['id'])
-        except Exception: pass
-        return L(
-            f'❌ لم تتم إضافة @{username}. يجب أن تكون رتبة البوت داخل الغرفة «مشرف» أو «ادمن» أولاً. الرتبة الحالية: «{rank or "غير معروف"}».',
-            f'❌ @{username} was not added. The bot must be Moderator or Admin first. Current rank: {rank or "unknown"}.'
-        )
+    # Main/control bots must be Moderator/Admin. Silent (hang) bots do not
+    # need elevated rank and enter the room immediately after login.
+    rank = await member_rank(client, room['id'], client_user_id(client)) or 'unknown'
+    if role == 'main':
+        ready, rank = await require_bot_admin(client, room)
+        if not ready:
+            try: await leave_bot(client, room['id'])
+            except Exception: pass
+            return L(
+                f'❌ لم تتم إضافة @{username}. يجب أن يكون بوت التحكم «مشرف» أو «ادمن». الرتبة الحالية: «{rank or "غير معروف"}».',
+                f'❌ @{username} was not added. The Main control bot must be Moderator/Admin. Current rank: {rank or "unknown"}.'
+            )
     bid=str(uuid.uuid4())
     rec={'id':bid,'username':username,'password':password,'room_id':room['id'],'room_name':room['name'],'role':role,'rank':rank,'master_id':str(master_id),'master_name':master_name,'status':'online','created_at':now(),'updated_at':now()}
     bots.append(rec); save(BOTS_FILE,bots)
@@ -717,7 +761,7 @@ async def primary_master_for_room(sender_id, room_name):
 async def control_action(sender,text):
     t=text.strip(); low=t.lower()
     if low in ('help','مساعدة','الاوامر','الأوامر'):
-        return L('''al-sfeer:\nabot Bot Commands\n1. user@pass@room - Create Main bot\n2. hb@user@pass@room - Create Hang bot\n3. del@room - Delete main bots from a room\n4. delall@room - Delete all bots from a room\n5. clean@room - Clean room memory\n6. bots - Display active bots\n7. room@name - Display room information\n8. lang@ar / lang@en - Change language\n9. master@user@room - Add a master/delegate (primary master only)\n10. delmaster@user@room - Remove a delegate (primary master only)\n11. masters@room - List room masters\n\n⚠️ أول شخص يضيف بوتاً إلى الغرفة يصبح الماستر الأساسي بعد نجاح التحقق من رتبة البوت.''','''al-sfeer:\nabot Bot Commands\n1. user@pass@room - Create Main bot\n2. hb@user@pass@room - Create Hang bot\n3. del@room - Delete main bots from a room\n4. delall@room - Delete all bots from a room\n5. clean@room - Clean room memory\n6. bots - Display active bots\n7. room@name - Display room information\n8. lang@ar / lang@en - Change language\n9. master@user@room - Add a master/delegate (primary master only)\n10. delmaster@user@room - Remove a delegate (primary master only)\n11. masters@room - List room masters\n\n⚠️ The first user who successfully adds a bot becomes the primary master, only after the bot is Moderator/Admin.''', user_id=sender)
+        return L('''al-sfeer:\ngbot Bot Commands\n1. user@pass@room - Create Main bot\n2. hb@user@pass@room / بوتصامت@user@pass@room - Create silent bot\n3. del@room - Delete main bots from a room\n4. delall@room - Delete all bots from a room\n5. clean@room - Clean room memory\n6. bots - Display active bots\n7. room@name - Display room information\n8. lang@ar / lang@en - Change language\n9. master@user@room - Add a master/delegate (primary master only)\n10. delmaster@user@room - Remove a delegate (primary master only)\n11. masters@room - List room masters\n\n⚠️ أول شخص يضيف بوتاً إلى الغرفة يصبح الماستر الأساسي بعد نجاح التحقق من رتبة البوت.''','''al-sfeer:\ngbot Bot Commands\n1. user@pass@room - Create Main bot\n2. hb@user@pass@room / بوتصامت@user@pass@room - Create silent bot\n3. del@room - Delete main bots from a room\n4. delall@room - Delete all bots from a room\n5. clean@room - Clean room memory\n6. bots - Display active bots\n7. room@name - Display room information\n8. lang@ar / lang@en - Change language\n9. master@user@room - Add a master/delegate (primary master only)\n10. delmaster@user@room - Remove a delegate (primary master only)\n11. masters@room - List room masters\n\n⚠️ The first user who successfully adds a bot becomes the primary master, only after the bot is Moderator/Admin.''', user_id=sender)
     # The first DM after a successful room creation is the language chooser.
     pending=pending_language(sender)
     if pending:
@@ -761,7 +805,7 @@ async def control_action(sender,text):
     sender_name=(await username_of(sender)).strip().lstrip('@')
     # Format: username@password@room. Parse from the right so password may
     # contain @, e.g. username@gag@998877@Room Name.
-    excluded=('room@','del@','delall@','clean@','lang@','لغة@','hb@','master@','delmaster@','masters@')
+    excluded=('room@','del@','delall@','clean@','lang@','لغة@','hb@','بوتصامت@','صامت@','master@','delmaster@','masters@')
     if '@' in t and not low.startswith(excluded):
         payload, room = t.rsplit('@', 1)
         if '@' in payload:
@@ -769,6 +813,18 @@ async def control_action(sender,text):
             username=username.strip().lstrip('@'); password=password.strip(); room=room.strip()
             if username and password and room:
                 return await add_bot(username,password,room,'main',str(sender),sender_name)
+    # Silent bot aliases: بوتصامت@user@password@room / صامت@user@password@room
+    if low.startswith('بوتصامت@') or low.startswith('صامت@'):
+        prefix='بوتصامت@' if low.startswith('بوتصامت@') else 'صامت@'
+        payload=t[len(prefix):]
+        if '@' in payload:
+            payload, room = payload.rsplit('@', 1)
+            if '@' in payload:
+                username, password = payload.split('@', 1)
+                if username.strip() and password.strip() and room.strip():
+                    return await add_bot(username.strip().lstrip('@'),password.strip(),room.strip(),'hang',str(sender),sender_name)
+        return 'استخدم: hb@اسم_البوت@كلمة_المرور@اسم_الغرفة'
+
     if low.startswith('hb@'):
         payload=t[3:]
         if '@' in payload:
