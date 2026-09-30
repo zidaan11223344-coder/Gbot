@@ -1,4 +1,6 @@
-import os, json, uuid, asyncio, logging, re, time
+import os, json, uuid, asyncio, logging, re, time, math
+from collections import deque
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
@@ -12,7 +14,7 @@ BOTS_FILE=BASE/'control_bots.json'
 MASTERS_FILE=BASE/'room_masters.json'
 LANG_FILE=BASE/'language.json'
 LOG_DIR=BASE/'logs'; LOG_DIR.mkdir(exist_ok=True)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | control | %(message)s', handlers=[logging.FileHandler(LOG_DIR/'control.log',encoding='utf-8'), logging.StreamHandler()])
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | control | %(message)s', handlers=[RotatingFileHandler(LOG_DIR/'control.log',maxBytes=2*1024*1024,backupCount=3,encoding='utf-8'), logging.StreamHandler()])
 log=logging.getLogger('control')
 
 SERVER_URL=os.environ.get('SUPABASE_URL','').strip().rstrip('/')
@@ -23,8 +25,20 @@ CONTROL_USERNAME=os.environ.get('GIANT_USERNAME','').strip()
 CONTROL_PASSWORD=os.environ.get('GIANT_PASSWORD','')
 DEFAULT_LANG=(os.environ.get('CONTROL_LANGUAGE') or 'ar').strip().lower()
 ROOM_PASSWORD=os.environ.get('ROOM_PASSWORD','')
-POLL=max(0.15, float(os.environ.get('CONTROL_POLL_SECONDS','0.20')))
-CONTROL_BOT_VERSION='username-login-v6-room-isolation-rejoin-status'
+try:
+    # Keep DB polling consistent with the documented/default deployment value.
+    # A sub-second interval multiplies requests for every managed bot and loop.
+    configured_poll=float(os.environ.get('CONTROL_POLL_SECONDS','2'))
+    if not math.isfinite(configured_poll):
+        raise ValueError('CONTROL_POLL_SECONDS must be finite')
+    POLL=max(1.0, configured_poll)
+except (TypeError, ValueError):
+    log.warning('Invalid CONTROL_POLL_SECONDS; using 2 seconds')
+    POLL=2.0
+WELCOME_FALLBACK_SCAN_SECONDS=30.0
+MAX_CACHE_ENTRIES=2000
+PENDING_COMMAND_TTL_SECONDS=120.0
+CONTROL_BOT_VERSION='username-login-v7-resource-guards'
 if not SERVER_URL or not SERVER_KEY or not CONTROL_USERNAME or not CONTROL_PASSWORD:
     raise SystemExit('Missing SUPABASE_URL/SUPABASE_KEY/GIANT_USERNAME/GIANT_PASSWORD')
 
@@ -56,6 +70,48 @@ ROOM_MEMBER_PAGES={}
 # In-memory pending interactive commands. Keyed by room + sender so the
 # username sent as the next message is never lost between DB polling cycles.
 PENDING_COMMANDS={}
+
+def _prune_pending_commands():
+    current=time.time()
+    for key,item in list(PENDING_COMMANDS.items()):
+        try:
+            expired=current-float(item.get('created_at',0)) > PENDING_COMMAND_TTL_SECONDS
+        except (AttributeError, TypeError, ValueError):
+            expired=True
+        if expired:
+            PENDING_COMMANDS.pop(key,None)
+    while len(PENDING_COMMANDS)>MAX_CACHE_ENTRIES:
+        PENDING_COMMANDS.pop(next(iter(PENDING_COMMANDS)),None)
+
+def _set_pending_command(key,item):
+    _prune_pending_commands()
+    PENDING_COMMANDS.pop(key,None)
+    PENDING_COMMANDS[key]=dict(item)
+    while len(PENDING_COMMANDS)>MAX_CACHE_ENTRIES:
+        PENDING_COMMANDS.pop(next(iter(PENDING_COMMANDS)),None)
+
+def _prune_pending_state(pending):
+    changed=False
+    current=time.time()
+    for key,item in list(pending.items()):
+        try:
+            expired=current-float(item.get('created_at',0)) > PENDING_COMMAND_TTL_SECONDS
+        except (AttributeError, TypeError, ValueError):
+            expired=True
+        if expired:
+            pending.pop(key,None)
+            PENDING_COMMANDS.pop(key,None)
+            changed=True
+    while len(pending)>MAX_CACHE_ENTRIES:
+        pending.pop(next(iter(pending)),None)
+        changed=True
+    return changed
+
+def _remember_room_member_page(key,page):
+    ROOM_MEMBER_PAGES.pop(key,None)
+    ROOM_MEMBER_PAGES[key]=page
+    while len(ROOM_MEMBER_PAGES)>MAX_CACHE_ENTRIES:
+        ROOM_MEMBER_PAGES.pop(next(iter(ROOM_MEMBER_PAGES)),None)
 
 def load(path, default):
     try:
@@ -412,6 +468,7 @@ async def child_handle_admin(client, rec, room_id, sender_id, text, from_dm=Fals
     t=str(text or "").strip()
     low=norm(t)
     if not t: return None
+    _prune_pending_commands()
     # Check the exact room authorization before doing any profile lookup.
     # This keeps command response latency low and preserves strict room isolation.
     if not await child_is_room_master(client, room_id, sender_id):
@@ -636,11 +693,17 @@ async def child_handle_admin(client, rec, room_id, sender_id, text, from_dm=Fals
 
     # Interactive moderation like bot.py.
     pending=state.setdefault('pending',{})
+    if not isinstance(pending,dict):
+        pending={}
+        state['pending']=pending
+        _save_room_state(state)
+    if _prune_pending_state(pending):
+        _save_room_state(state)
     pending_key=f'{room_id}:{sender_id}'
     if low in ('حظر','طرد','كتم','فك الكتم','فك_الكتم','unmute','فك حظر','فك_الحظر'):
         action=('ban' if low=='حظر' else 'kick' if low=='طرد' else 'mute' if low=='كتم' else 'unmute' if low in ('فك الكتم','فك_الكتم','unmute') else 'unban')
         pending[pending_key]={'action':action,'room_id':str(room_id),'created_at':time.time()}
-        PENDING_COMMANDS[pending_key]=dict(pending[pending_key])
+        _set_pending_command(pending_key,pending[pending_key])
         log.info('PENDING SET room=%s sender=%s action=%s',room_id,sender_id,action)
         _save_room_state(state)
         return L(f"✍️ أرسل اسم المستخدم لتنفيذ «{t}».",f"✍️ Send the username to execute “{t}”.",room_id=room_id)
@@ -662,20 +725,20 @@ async def child_handle_admin(client, rec, room_id, sender_id, text, from_dm=Fals
     }
     if low in interactive_aliases:
         pending[pending_key]={'action':interactive_aliases[low],'room_id':str(room_id),'created_at':time.time()}
-        PENDING_COMMANDS[pending_key]=dict(pending[pending_key])
+        _set_pending_command(pending_key,pending[pending_key])
         log.info('PENDING SET room=%s sender=%s action=%s',room_id,sender_id,interactive_aliases[low])
         _save_room_state(state)
         return L(f"✍️ أرسل اسم المستخدم لتنفيذ «{t}».",f"✍️ Send the username to execute “{t}”.",room_id=room_id)
 
     if low in ('فك الحظر','فك_الحظر','تراجع عن الحظر','تراجع عن حظر','unban','unban@'):
         pending[pending_key]={'action':'unban','room_id':str(room_id),'created_at':time.time()}
-        PENDING_COMMANDS[pending_key]=dict(pending[pending_key])
+        _set_pending_command(pending_key,pending[pending_key])
         log.info('PENDING SET room=%s sender=%s action=unban',room_id,sender_id)
         _save_room_state(state)
         return L("✍️ أرسل اسم المستخدم لفك الحظر.","✍️ Send the username to unban.",room_id=room_id)
     if low in role_commands:
         pending[pending_key]={'action':role_commands[low],'room_id':str(room_id),'created_at':time.time()}
-        PENDING_COMMANDS[pending_key]=dict(pending[pending_key])
+        _set_pending_command(pending_key,pending[pending_key])
         log.info('PENDING SET room=%s sender=%s action=%s',room_id,sender_id,role_commands[low])
         _save_room_state(state)
         return L(f"✍️ أرسل اسم المستخدم لتنفيذ «{t}».",f"✍️ Send the username to execute “{t}”.",room_id=room_id)
@@ -918,6 +981,8 @@ async def child_room_loop(rec):
     # "حظر -> username" sequence shown in the screenshot).
     cursor=now()
     seen=set()
+    seen_order=deque()
+    last_welcome_scan=0.0
     while True:
         try:
             # Process room messages first. The fallback membership-diff welcome
@@ -940,8 +1005,9 @@ async def child_room_loop(rec):
                 if key in seen:
                     continue
                 seen.add(key)
-                if len(seen)>1000:
-                    seen=set(list(seen)[-500:])
+                seen_order.append(key)
+                if len(seen_order)>1000:
+                    seen.discard(seen_order.popleft())
                 if created and created>newest:
                     newest=created
 
@@ -973,7 +1039,9 @@ async def child_room_loop(rec):
             # Fallback only: explicit Giant join events above are handled
             # immediately. This DB membership diff runs after command handling
             # so welcome detection cannot delay normal commands.
-            await child_welcome_new_members(client, room_id)
+            if time.monotonic()-last_welcome_scan >= WELCOME_FALLBACK_SCAN_SECONDS:
+                last_welcome_scan=time.monotonic()
+                await child_welcome_new_members(client, room_id)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1484,7 +1552,7 @@ async def command_room_members(client, room_id, sender_id, next_page=False):
     pages=max(1,(total+19)//20)
     if page>=pages:
         return f'📄 لا توجد صفحة تالية. آخر صفحة هي {pages}/{pages}.'
-    ROOM_MEMBER_PAGES[key]=page
+    _remember_room_member_page(key,page)
     chunk=names[page*20:(page+1)*20]
     lines=[f'👥 مستخدمو الغرفة — {total}', f'📄 الصفحة {page+1}/{pages}']
     lines.extend(f'• {name}' for name in chunk)
