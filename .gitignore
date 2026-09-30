@@ -1,0 +1,15 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+logs/*.log
+logs/*.log.*
+control_bots.json
+control_state.json
+room_control_state.json
+room_replies.json
+room_welcome.json
+room_welcome_seen.json
+room_undo.json
+room_bot_greeting_seen.json
